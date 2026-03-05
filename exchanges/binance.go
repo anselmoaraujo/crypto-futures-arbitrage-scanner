@@ -11,6 +11,62 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+const (
+	binanceReadTimeout       = 70 * time.Second
+	binanceWriteTimeout      = 10 * time.Second
+	binancePingInterval      = 20 * time.Second
+	binanceBaseReconnectWait = 2 * time.Second
+	binanceMaxReconnectWait  = 30 * time.Second
+	binanceLogEveryNFailures = 5
+)
+
+func setupBinanceConnection(conn *websocket.Conn) chan struct{} {
+	stopPing := make(chan struct{})
+
+	_ = conn.SetReadDeadline(time.Now().Add(binanceReadTimeout))
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(binanceReadTimeout))
+	})
+
+	go func() {
+		ticker := time.NewTicker(binancePingInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				_ = conn.SetWriteDeadline(time.Now().Add(binanceWriteTimeout))
+				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+					return
+				}
+			case <-stopPing:
+				return
+			}
+		}
+	}()
+
+	return stopPing
+}
+
+func binanceReconnectDelay(attempt int) time.Duration {
+	// Exponential backoff capped at binanceMaxReconnectWait.
+	delay := binanceBaseReconnectWait
+	for i := 1; i < attempt; i++ {
+		delay *= 2
+		if delay >= binanceMaxReconnectWait {
+			return binanceMaxReconnectWait
+		}
+	}
+	if delay > binanceMaxReconnectWait {
+		return binanceMaxReconnectWait
+	}
+	return delay
+}
+
+func shouldLogBinanceFailure(failureCount int) bool {
+	return failureCount == 1 || failureCount%binanceLogEveryNFailures == 0
+}
+
 type BinanceFuturesTrade struct {
 	EventType string `json:"e"`
 	EventTime int64  `json:"E"`
@@ -41,16 +97,25 @@ func ConnectBinanceFutures(symbols []string, priceChan chan<- PriceData, orderbo
 	streamParam := strings.Join(streamNames, "/")
 
 	wsURL := fmt.Sprintf("wss://fstream.binance.com/stream?streams=%s", streamParam)
+	reconnectAttempt := 0
+	readFailures := 0
 
 	for {
 		conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
 		if err != nil {
-			log.Printf("Binance futures connection error: %v", err)
-			time.Sleep(5 * time.Second)
+			reconnectAttempt++
+			wait := binanceReconnectDelay(reconnectAttempt)
+			if shouldLogBinanceFailure(reconnectAttempt) {
+				log.Printf("Binance futures connection error (attempt=%d, retry=%s): %v", reconnectAttempt, wait, err)
+			}
+			time.Sleep(wait)
 			continue
 		}
 
 		log.Printf("Connected to Binance futures WebSocket")
+		reconnectAttempt = 0
+		readFailures = 0
+		stopPing := setupBinanceConnection(conn)
 
 		for {
 			var message struct {
@@ -60,10 +125,15 @@ func ConnectBinanceFutures(symbols []string, priceChan chan<- PriceData, orderbo
 
 			err := conn.ReadJSON(&message)
 			if err != nil {
-				log.Printf("Binance futures read error: %v", err)
+				readFailures++
+				if shouldLogBinanceFailure(readFailures) {
+					log.Printf("Binance futures read error (count=%d): %v", readFailures, err)
+				}
+				close(stopPing)
 				conn.Close()
 				break
 			}
+			_ = conn.SetReadDeadline(time.Now().Add(binanceReadTimeout))
 
 			if strings.Contains(message.Stream, "@bookTicker") {
 				var bookTicker BinanceFuturesBookTicker
@@ -119,7 +189,8 @@ func ConnectBinanceFutures(symbols []string, priceChan chan<- PriceData, orderbo
 			}
 		}
 
-		time.Sleep(2 * time.Second)
+		reconnectAttempt++
+		time.Sleep(binanceReconnectDelay(reconnectAttempt))
 	}
 }
 
@@ -155,16 +226,25 @@ func ConnectBinanceSpot(symbols []string, priceChan chan<- PriceData, orderbookC
 	streamParam := strings.Join(streamNames, "/")
 
 	wsURL := fmt.Sprintf("wss://stream.binance.com:9443/stream?streams=%s", streamParam)
+	reconnectAttempt := 0
+	readFailures := 0
 
 	for {
 		conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
 		if err != nil {
-			log.Printf("Binance spot connection error: %v", err)
-			time.Sleep(5 * time.Second)
+			reconnectAttempt++
+			wait := binanceReconnectDelay(reconnectAttempt)
+			if shouldLogBinanceFailure(reconnectAttempt) {
+				log.Printf("Binance spot connection error (attempt=%d, retry=%s): %v", reconnectAttempt, wait, err)
+			}
+			time.Sleep(wait)
 			continue
 		}
 
 		log.Printf("Connected to Binance spot WebSocket")
+		reconnectAttempt = 0
+		readFailures = 0
+		stopPing := setupBinanceConnection(conn)
 
 		for {
 			var message struct {
@@ -174,10 +254,15 @@ func ConnectBinanceSpot(symbols []string, priceChan chan<- PriceData, orderbookC
 
 			err := conn.ReadJSON(&message)
 			if err != nil {
-				log.Printf("Binance spot read error: %v", err)
+				readFailures++
+				if shouldLogBinanceFailure(readFailures) {
+					log.Printf("Binance spot read error (count=%d): %v", readFailures, err)
+				}
+				close(stopPing)
 				conn.Close()
 				break
 			}
+			_ = conn.SetReadDeadline(time.Now().Add(binanceReadTimeout))
 
 			if strings.Contains(message.Stream, "@bookTicker") {
 				var bookTicker BinanceSpotBookTicker
@@ -233,6 +318,7 @@ func ConnectBinanceSpot(symbols []string, priceChan chan<- PriceData, orderbookC
 			}
 		}
 
-		time.Sleep(2 * time.Second)
+		reconnectAttempt++
+		time.Sleep(binanceReconnectDelay(reconnectAttempt))
 	}
 }

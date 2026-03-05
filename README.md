@@ -10,7 +10,7 @@ in crypto, this isn't hidden behind expensive pro feeds. you can actually see th
 
 ## what can it do?
 
-- connect to 9 spot/futures exchanges (binance, bybit, hyperliquid, kraken, okx, gate.io, paradex) over websockets
+- connect to 11 spot/futures exchanges (binance, bybit, hyperliquid, kraken, okx, gate.io, paradex, coinbase spot + coinbase intx perps) over websockets
 - live arbitrage matrix: highlights when the price difference is big enough
 - watch multiple pairs: btcusdt, ethusdt, xrpusdt, solusdt
 - auto adjusts decimals by asset/price
@@ -56,10 +56,24 @@ covers:
 - okx futures
 - gate.io futures
 - paradex futures
+- coinbase international futures (perps)
 
 **spot exchanges:**
 - binance spot
 - bybit spot
+- coinbase spot
+
+## coinbase intx perps setup
+
+to enable `coinbase_futures`, set:
+
+```
+COINBASE_INTX_KEY=...
+COINBASE_INTX_SECRET=...
+COINBASE_INTX_PASSPHRASE=...
+```
+
+if these are missing, the app skips coinbase perps and logs that it's disabled.
 
 ## config
 

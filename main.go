@@ -26,7 +26,9 @@ type ArbitrageOpportunity struct {
 
 type FuturesScanner struct {
 	prices           map[string]map[string]float64
+	fundingRates     map[string]map[string]exchanges.FundingData // symbol -> source -> funding
 	pricesMutex      sync.RWMutex
+	fundingMutex     sync.RWMutex
 	wsClients        map[*websocket.Conn]bool
 	clientsMutex     sync.RWMutex
 	wsWriteMutex     sync.Mutex // Protects WebSocket writes
@@ -34,6 +36,7 @@ type FuturesScanner struct {
 	priceChan        chan exchanges.PriceData
 	orderbookChan    chan exchanges.OrderbookData
 	tradeChan        chan exchanges.TradeData
+	fundingChan      chan exchanges.FundingData
 	lastOpportunity  map[string]time.Time // Track last alert per symbol
 	opportunityMutex sync.RWMutex
 }
@@ -41,10 +44,12 @@ type FuturesScanner struct {
 func NewFuturesScanner() *FuturesScanner {
 	return &FuturesScanner{
 		prices:          make(map[string]map[string]float64),
+		fundingRates:    make(map[string]map[string]exchanges.FundingData),
 		wsClients:       make(map[*websocket.Conn]bool),
 		priceChan:       make(chan exchanges.PriceData, 1000),
 		orderbookChan:   make(chan exchanges.OrderbookData, 1000),
 		tradeChan:       make(chan exchanges.TradeData, 1000),
+		fundingChan:     make(chan exchanges.FundingData, 200),
 		lastOpportunity: make(map[string]time.Time),
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
@@ -82,6 +87,16 @@ func (s *FuturesScanner) processTrades() {
 	}
 }
 
+func (s *FuturesScanner) processFundingRates() {
+	for fundingData := range s.fundingChan {
+		s.fundingMutex.Lock()
+		if s.fundingRates[fundingData.Symbol] == nil {
+			s.fundingRates[fundingData.Symbol] = make(map[string]exchanges.FundingData)
+		}
+		s.fundingRates[fundingData.Symbol][fundingData.Source] = fundingData
+		s.fundingMutex.Unlock()
+	}
+}
 
 func (s *FuturesScanner) updatePrice(data exchanges.PriceData) {
 	s.pricesMutex.Lock()
@@ -309,6 +324,59 @@ func (s *FuturesScanner) broadcastPrices() {
 	}
 }
 
+func (s *FuturesScanner) broadcastFundingRates() {
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		s.fundingMutex.RLock()
+		fundingCopy := make(map[string]map[string]exchanges.FundingData)
+		for symbol, perSource := range s.fundingRates {
+			fundingCopy[symbol] = make(map[string]exchanges.FundingData)
+			for source, rate := range perSource {
+				fundingCopy[symbol][source] = rate
+			}
+		}
+		s.fundingMutex.RUnlock()
+
+		if len(fundingCopy) == 0 {
+			continue
+		}
+
+		message := map[string]interface{}{
+			"type":    "funding_rates",
+			"funding": fundingCopy,
+		}
+
+		s.clientsMutex.RLock()
+		clients := make([]*websocket.Conn, 0, len(s.wsClients))
+		for client := range s.wsClients {
+			clients = append(clients, client)
+		}
+		s.clientsMutex.RUnlock()
+
+		s.wsWriteMutex.Lock()
+		var toRemove []*websocket.Conn
+		for _, client := range clients {
+			err := client.WriteJSON(message)
+			if err != nil {
+				log.Printf("WebSocket write error: %v", err)
+				client.Close()
+				toRemove = append(toRemove, client)
+			}
+		}
+		s.wsWriteMutex.Unlock()
+
+		if len(toRemove) > 0 {
+			s.clientsMutex.Lock()
+			for _, client := range toRemove {
+				delete(s.wsClients, client)
+			}
+			s.clientsMutex.Unlock()
+		}
+	}
+}
+
 func (s *FuturesScanner) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	log.Printf("WebSocket connection attempt from %s", r.RemoteAddr)
 	
@@ -355,6 +423,7 @@ func main() {
 	go scanner.processPrices()
 	go scanner.processOrderbooks()
 	go scanner.processTrades()
+	go scanner.processFundingRates()
 
 	// Start exchange connections with orderbook feeds
 	go exchanges.ConnectBinanceFutures(symbols, scanner.priceChan, scanner.orderbookChan, scanner.tradeChan)
@@ -364,15 +433,19 @@ func main() {
 	go exchanges.ConnectOKXFutures(symbols, scanner.priceChan, scanner.orderbookChan, scanner.tradeChan)
 	go exchanges.ConnectGateFutures(symbols, scanner.priceChan, scanner.orderbookChan, scanner.tradeChan)
 	go exchanges.ConnectParadexFutures(symbols, scanner.priceChan, scanner.orderbookChan, scanner.tradeChan)
+	go exchanges.ConnectCoinbaseFutures(symbols, scanner.priceChan, scanner.orderbookChan, scanner.tradeChan)
 	
 	// Start spot exchange connections with orderbook feeds
 	go exchanges.ConnectBinanceSpot(symbols, scanner.priceChan, scanner.orderbookChan, scanner.tradeChan)
 	go exchanges.ConnectBybitSpot(symbols, scanner.priceChan, scanner.orderbookChan, scanner.tradeChan)
+	go exchanges.ConnectCoinbaseSpot(symbols, scanner.priceChan, scanner.orderbookChan, scanner.tradeChan)
 	
 	// Start Pyth price feed connection
 	go exchanges.ConnectPythPrices(symbols, scanner.priceChan, scanner.orderbookChan, scanner.tradeChan)
+	go exchanges.ConnectFundingRates(symbols, scanner.fundingChan)
 
 	go scanner.broadcastPrices()
+	go scanner.broadcastFundingRates()
 
 	http.HandleFunc("/ws", scanner.handleWebSocket)
 	http.Handle("/", http.FileServer(http.Dir("./static/")))

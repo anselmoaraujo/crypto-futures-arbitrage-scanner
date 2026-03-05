@@ -5,6 +5,7 @@ class FuturesArbitrageScanner {
         this.priceHistory = new Map();
         this.arbitrageOpportunities = [];
         this.currentSpreads = new Map();
+        this.fundingBySymbol = new Map();
         this.maxHistoryPoints = 500; // Reduced from 1000
         this.maxOpportunities = 25; // Reduced from 50
         this.connectedSources = new Set();
@@ -44,11 +45,13 @@ class FuturesArbitrageScanner {
             'bybit_futures': true,
             'hyperliquid_futures': true,
             'kraken_futures': true,
+            'coinbase_futures': true,
             'okx_futures': true,
             'gate_futures': true,
             'paradex_futures': true,
             'binance_spot': true,
             'bybit_spot': true,
+            'coinbase_spot': true,
             'pyth': true
         };
         
@@ -223,7 +226,19 @@ class FuturesArbitrageScanner {
                 borderColor: '#444',
                 textColor: '#888',
                 timeVisible: true,
-                secondsVisible: false,
+                secondsVisible: true,
+                tickMarkFormatter: (time) => {
+                    if (typeof time !== 'number') {
+                        return '';
+                    }
+                    const date = new Date(time * 1000);
+                    return date.toLocaleTimeString([], {
+                        hour12: false,
+                        hour: '2-digit',
+                        minute: '2-digit',
+                        second: '2-digit'
+                    });
+                },
             },
             handleScroll: {
                 mouseWheel: true,
@@ -242,11 +257,13 @@ class FuturesArbitrageScanner {
             { key: 'bybit_futures', label: 'Bybit Futures', color: '#f7931a', lineStyle: LightweightCharts.LineStyle.Solid },
             { key: 'hyperliquid_futures', label: 'Hyperliquid Futures', color: '#97FCE4', lineStyle: LightweightCharts.LineStyle.Solid },
             { key: 'kraken_futures', label: 'Kraken Futures', color: '#5a5aff', lineStyle: LightweightCharts.LineStyle.Solid },
+            { key: 'coinbase_futures', label: 'Coinbase Futures', color: '#1f5eff', lineStyle: LightweightCharts.LineStyle.Solid },
             { key: 'okx_futures', label: 'OKX Futures', color: '#1890ff', lineStyle: LightweightCharts.LineStyle.Solid },
             { key: 'gate_futures', label: 'Gate.io Futures', color: '#6c5ce7', lineStyle: LightweightCharts.LineStyle.Solid },
             { key: 'paradex_futures', label: 'Paradex Futures', color: '#ff6b6b', lineStyle: LightweightCharts.LineStyle.Solid },
             { key: 'binance_spot', label: 'Binance Spot', color: '#f0b90b', lineStyle: LightweightCharts.LineStyle.Dashed },
             { key: 'bybit_spot', label: 'Bybit Spot', color: '#f7931a', lineStyle: LightweightCharts.LineStyle.Dashed },
+            { key: 'coinbase_spot', label: 'Coinbase Spot', color: '#2f6bff', lineStyle: LightweightCharts.LineStyle.Dashed },
             { key: 'pyth', label: 'Pyth Oracle', color: '#00ff88', lineStyle: LightweightCharts.LineStyle.Dotted },
         ];
 
@@ -428,7 +445,17 @@ class FuturesArbitrageScanner {
             this.handleArbitrageOpportunity(data.opportunity);
         } else if (data.type === 'spreads') {
             this.handleSpreadsUpdate(data);
+        } else if (data.type === 'funding_rates') {
+            this.handleFundingRatesUpdate(data);
         }
+    }
+
+    handleFundingRatesUpdate(data) {
+        if (!data.funding || typeof data.funding !== 'object') {
+            return;
+        }
+        this.fundingBySymbol = new Map(Object.entries(data.funding));
+        this.updateSourceList();
     }
 
     updatePrices(prices) {
@@ -531,6 +558,56 @@ class FuturesArbitrageScanner {
             this.updateSourcePrices();
         }
     }
+
+    getFundingForSource(source) {
+        const fundingForSymbol = this.fundingBySymbol.get(this.currentSymbol);
+        if (!fundingForSymbol || !fundingForSymbol[source]) {
+            return null;
+        }
+        return fundingForSymbol[source];
+    }
+
+    formatFundingRate(rate) {
+        if (!Number.isFinite(rate)) {
+            return 'n/a';
+        }
+        const pct = rate * 100;
+        const sign = pct > 0 ? '+' : '';
+        return `${sign}${pct.toFixed(4)}%`;
+    }
+
+    getFundingClass(rate) {
+        if (rate > 0) return 'positive';
+        if (rate < 0) return 'negative';
+        return 'neutral';
+    }
+
+    formatFundingTime(timestamp) {
+        if (!timestamp || Number.isNaN(timestamp)) {
+            return '--';
+        }
+        const date = new Date(timestamp);
+        return date.toLocaleTimeString([], {
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit'
+        });
+    }
+
+    formatPremiumPct(premiumPct) {
+        if (!Number.isFinite(premiumPct)) {
+            return 'n/a';
+        }
+        const sign = premiumPct > 0 ? '+' : '';
+        return `${sign}${premiumPct.toFixed(3)}%`;
+    }
+
+    getPremiumClass(premiumPct) {
+        if (!Number.isFinite(premiumPct)) return 'na';
+        if (premiumPct > 0) return 'positive';
+        if (premiumPct < 0) return 'negative';
+        return 'neutral';
+    }
     
     recreateSourceList() {
         const sourceList = document.getElementById('sourceList');
@@ -539,22 +616,33 @@ class FuturesArbitrageScanner {
             'bybit_futures': '#f7931a',
             'hyperliquid_futures': '#97FCE4',
             'kraken_futures': '#5a5aff',
+            'coinbase_futures': '#1f5eff',
             'okx_futures': '#1890ff',
             'gate_futures': '#6c5ce7',
             'paradex_futures': '#ff6b6b',
             'binance_spot': '#ffb347',
             'bybit_spot': '#f7931a',
+            'coinbase_spot': '#2f6bff',
             'pyth': '#00ff88',
         };
 
         let html = '';
         for (const [source, data] of this.sources.entries()) {
             const changeClass = data.change >= 0 ? 'up' : 'down';
-            const changeSymbol = data.change >= 0 ? '↑' : '↓';
+            const changeArrow = data.change >= 0 ? '\u2191' : '\u2193';
             const color = sourceColors[source] || '#888';
             const isEnabled = this.isSourceEnabled(source);
             const opacity = isEnabled ? '1' : '0.4';
-            
+            const fundingData = this.getFundingForSource(source);
+            const fundingClass = fundingData ? this.getFundingClass(fundingData.rate) : 'na';
+            const fundingText = fundingData
+                ? `F L:${this.formatFundingRate(fundingData.last_rate)} N:${this.formatFundingRate(fundingData.next_rate)} @ ${this.formatFundingTime(fundingData.next_funding_time)}`
+                : 'F n/a';
+            const premiumClass = fundingData ? this.getPremiumClass(fundingData.premium_pct) : 'na';
+            const premiumText = fundingData
+                ? `Basis ${this.formatPremiumPct(fundingData.premium_pct)}`
+                : 'Basis n/a';
+
             html += `
                 <div class="source-item" data-source="${source}" style="opacity: ${opacity};">
                     <div style="display: flex; align-items: center; gap: 8px;">
@@ -567,32 +655,56 @@ class FuturesArbitrageScanner {
                     <div>
                         <span class="source-price">$${this.formatPrice(data.price)}</span>
                         <span class="price-change ${changeClass}">
-                            ${changeSymbol} ${Math.abs(data.changePercent).toFixed(3)}%
+                            ${changeArrow} ${Math.abs(data.changePercent).toFixed(3)}%
                         </span>
+                        <div class="funding-rate ${fundingClass}">${fundingText}</div>
+                        <div class="basis-rate ${premiumClass}">${premiumText}</div>
                     </div>
                 </div>
             `;
         }
-        
+
         sourceList.innerHTML = html;
     }
-    
+
     updateSourcePrices() {
         for (const [source, data] of this.sources.entries()) {
             const sourceItem = document.querySelector(`[data-source="${source}"]`);
             if (sourceItem) {
                 const priceElement = sourceItem.querySelector('.source-price');
                 const changeElement = sourceItem.querySelector('.price-change');
-                
+                const fundingElement = sourceItem.querySelector('.funding-rate');
+                const basisElement = sourceItem.querySelector('.basis-rate');
+
                 if (priceElement) {
                     priceElement.textContent = `$${this.formatPrice(data.price)}`;
                 }
-                
+
                 if (changeElement) {
                     const changeClass = data.change >= 0 ? 'up' : 'down';
-                    const changeSymbol = data.change >= 0 ? '↑' : '↓';
+                    const changeArrow = data.change >= 0 ? '\u2191' : '\u2193';
                     changeElement.className = `price-change ${changeClass}`;
-                    changeElement.textContent = `${changeSymbol} ${Math.abs(data.changePercent).toFixed(3)}%`;
+                    changeElement.textContent = `${changeArrow} ${Math.abs(data.changePercent).toFixed(3)}%`;
+                }
+
+                if (fundingElement) {
+                    const fundingData = this.getFundingForSource(source);
+                    const fundingClass = fundingData ? this.getFundingClass(fundingData.rate) : 'na';
+                    const fundingText = fundingData
+                        ? `F L:${this.formatFundingRate(fundingData.last_rate)} N:${this.formatFundingRate(fundingData.next_rate)} @ ${this.formatFundingTime(fundingData.next_funding_time)}`
+                        : 'F n/a';
+                    fundingElement.className = `funding-rate ${fundingClass}`;
+                    fundingElement.textContent = fundingText;
+                }
+
+                if (basisElement) {
+                    const fundingData = this.getFundingForSource(source);
+                    const premiumClass = fundingData ? this.getPremiumClass(fundingData.premium_pct) : 'na';
+                    const premiumText = fundingData
+                        ? `Basis ${this.formatPremiumPct(fundingData.premium_pct)}`
+                        : 'Basis n/a';
+                    basisElement.className = `basis-rate ${premiumClass}`;
+                    basisElement.textContent = premiumText;
                 }
             }
         }
@@ -611,7 +723,7 @@ class FuturesArbitrageScanner {
     performChartUpdate() {
         if (!this.chart || this.priceHistory.size === 0) return;
 
-        const sourceNames = ['binance_futures', 'bybit_futures', 'hyperliquid_futures', 'kraken_futures', 'okx_futures', 'gate_futures', 'paradex_futures', 'binance_spot', 'bybit_spot', 'pyth'];
+        const sourceNames = ['binance_futures', 'bybit_futures', 'hyperliquid_futures', 'kraken_futures', 'coinbase_futures', 'okx_futures', 'gate_futures', 'paradex_futures', 'binance_spot', 'bybit_spot', 'coinbase_spot', 'pyth'];
         
         sourceNames.forEach(source => {
             const series = this.chartSeries.get(source);
@@ -852,11 +964,13 @@ class FuturesArbitrageScanner {
             'bybit_futures': 'BYB-F',
             'hyperliquid_futures': 'HYP',
             'kraken_futures': 'KRK-F',
+            'coinbase_futures': 'CB-F',
             'okx_futures': 'OKX-F',
             'gate_futures': 'GAT-F',
             'paradex_futures': 'PDX',
             'binance_spot': 'BIN-S',
             'bybit_spot': 'BYB-S',
+            'coinbase_spot': 'CB-S',
             'pyth': 'PYTH'
         };
         return names[source] || source.substring(0, 3).toUpperCase();
@@ -924,3 +1038,4 @@ document.addEventListener('DOMContentLoaded', () => {
     window.scanner = new FuturesArbitrageScanner();
     console.log('Futures Arbitrage Scanner initialized');
 });
+
